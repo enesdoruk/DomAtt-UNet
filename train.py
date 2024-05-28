@@ -1,21 +1,23 @@
 import argparse
 import logging
 import os
-
+import random
+import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.transforms as transforms
+import torchvision.transforms.functional as TF
 from pathlib import Path
 from torch import optim
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
-from torch.utils.data.distributed import DistributedSampler
-import torch.distributed as dist
+from torchmetrics.image import StructuralSimilarityIndexMeasure
 
 import wandb
 from evaluate import evaluate
 from unet import UNet
-from utils.data_loading import BasicDataset
+from utils.data_loading import BasicDataset, CarvanaDataset
 from utils.dice_score import dice_loss
 
 dir_img = Path('./data/imgs/')
@@ -37,8 +39,11 @@ def train_model(
         momentum: float = 0.999,
         gradient_clipping: float = 1.0,
 ):
-
-    dataset = BasicDataset(dir_img, dir_mask, img_scale)
+    # 1. Create dataset
+    try:
+        dataset = CarvanaDataset(dir_img, dir_mask, img_scale)
+    except (AssertionError, RuntimeError, IndexError):
+        dataset = BasicDataset(dir_img, dir_mask, img_scale)
 
     # 2. Split into train / validation partitions
     n_val = int(len(dataset) * val_percent)
@@ -51,7 +56,7 @@ def train_model(
     val_loader = DataLoader(val_set, shuffle=False, drop_last=True, **loader_args)
 
     # (Initialize logging)
-    experiment = wandb.init(project='enseg', name='base', resume='allow', anonymous='must')
+    experiment = wandb.init(project='U-Net', resume='allow', anonymous='must')
     experiment.config.update(
         dict(epochs=epochs, batch_size=batch_size, learning_rate=learning_rate,
              val_percent=val_percent, save_checkpoint=save_checkpoint, img_scale=img_scale, amp=amp)
@@ -74,8 +79,10 @@ def train_model(
                               lr=learning_rate, weight_decay=weight_decay, momentum=momentum, foreach=True)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=5)  # goal: maximize Dice score
     grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
-    criterion = nn.CrossEntropyLoss() if model.module.n_classes > 1 else nn.BCEWithLogitsLoss()
+    criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss()
     global_step = 0
+    
+    ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
 
     # 5. Begin training
     for epoch in range(1, epochs + 1):
@@ -85,8 +92,8 @@ def train_model(
             for batch in train_loader:
                 images, true_masks = batch['image'], batch['mask']
 
-                assert images.shape[1] == model.module.n_channels, \
-                    f'Network has been defined with {model.module.n_channels} input channels, ' \
+                assert images.shape[1] == model.n_channels, \
+                    f'Network has been defined with {model.n_channels} input channels, ' \
                     f'but loaded images have {images.shape[1]} channels. Please check that ' \
                     'the images are loaded correctly.'
 
@@ -94,17 +101,22 @@ def train_model(
                 true_masks = true_masks.to(device=device, dtype=torch.long)
 
                 with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
-                    masks_pred = model(images)
-                    if model.module.n_classes == 1:
+                    masks_pred, feat = model(images)
+                    
+                    feat_ssim = feat.mean(dim=1).unsqueeze(dim=0)
+                    img_ssim = images.mean(dim=1).unsqueeze(dim=0)
+    
+                    if model.n_classes == 1:
                         loss = criterion(masks_pred.squeeze(1), true_masks.float())
                         loss += dice_loss(F.sigmoid(masks_pred.squeeze(1)), true_masks.float(), multiclass=False)
                     else:
                         loss = criterion(masks_pred, true_masks)
                         loss += dice_loss(
                             F.softmax(masks_pred, dim=1).float(),
-                            F.one_hot(true_masks, model.module.n_classes).permute(0, 3, 1, 2).float(),
+                            F.one_hot(true_masks, model.n_classes).permute(0, 3, 1, 2).float(),
                             multiclass=True
                         )
+                        loss += ssim(feat_ssim, img_ssim)
 
                 optimizer.zero_grad(set_to_none=True)
                 grad_scaler.scale(loss).backward()
@@ -166,7 +178,7 @@ def train_model(
 def get_args():
     parser = argparse.ArgumentParser(description='Train the UNet on images and target masks')
     parser.add_argument('--epochs', '-e', metavar='E', type=int, default=5, help='Number of epochs')
-    parser.add_argument('--batch-size', '-b', dest='batch_size', metavar='B', type=int, default=2, help='Batch size')
+    parser.add_argument('--batch-size', '-b', dest='batch_size', metavar='B', type=int, default=1, help='Batch size')
     parser.add_argument('--learning-rate', '-l', metavar='LR', type=float, default=1e-5,
                         help='Learning rate', dest='lr')
     parser.add_argument('--load', '-f', type=str, default=False, help='Load model from a .pth file')
@@ -175,7 +187,7 @@ def get_args():
                         help='Percent of the data that is used as validation (0-100)')
     parser.add_argument('--amp', action='store_true', default=False, help='Use mixed precision')
     parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
-    parser.add_argument('--classes', '-c', type=int, default=100, help='Number of classes')
+    parser.add_argument('--classes', '-c', type=int, default=2, help='Number of classes')
 
     return parser.parse_args()
 
@@ -184,13 +196,7 @@ if __name__ == '__main__':
     args = get_args()
 
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
-    if torch.cuda.device_count() > 1:
-        n_gpu = torch.cuda.device_count()
-        device = torch.device('cuda:0' if n_gpu > 0 else 'cpu')
-        device_ids = list(range(n_gpu))
-        print("n_gpu: {}".format(n_gpu))
-    else:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logging.info(f'Using device {device}')
 
     # Change here to adapt to your data
@@ -198,13 +204,11 @@ if __name__ == '__main__':
     # n_classes is the number of probabilities you want to get per pixel
     model = UNet(n_channels=3, n_classes=args.classes, bilinear=args.bilinear)
     model = model.to(memory_format=torch.channels_last)
-    if torch.cuda.device_count() > 1:
-        model = torch.nn.DataParallel(model, device_ids=device_ids)
 
     logging.info(f'Network:\n'
-                 f'\t{model.module.n_channels} input channels\n'
-                 f'\t{model.module.n_classes} output channels (classes)\n'
-                 f'\t{"Bilinear" if model.module.bilinear else "Transposed conv"} upscaling')
+                 f'\t{model.n_channels} input channels\n'
+                 f'\t{model.n_classes} output channels (classes)\n'
+                 f'\t{"Bilinear" if model.bilinear else "Transposed conv"} upscaling')
 
     if args.load:
         state_dict = torch.load(args.load, map_location=device)
@@ -213,7 +217,6 @@ if __name__ == '__main__':
         logging.info(f'Model loaded from {args.load}')
 
     model.to(device=device)
-
     try:
         train_model(
             model=model,
