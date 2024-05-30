@@ -136,4 +136,4 @@ You can use your own dataset as long as you make sure it is loaded properly in `
 
 
 ## Acknowledgments
-- We thank the authors of [UNet](https://github.com/milesial/Pytorch-UNet)their open-source codes.
+- We thank the authors of [UNet](https://github.com/milesial/Pytorch-UNet) their open-source codes.
